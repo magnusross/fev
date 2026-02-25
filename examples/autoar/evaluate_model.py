@@ -268,9 +268,15 @@ class AutoARModel:
                     # Series too short for HPO; fall back to smallest candidate
                     best_lags = valid_lags[-1]
 
+            # Clamp best_lags to be safe for the current numdiff.
+            # best_lags was selected on the first window; if a later window has a
+            # larger numdiff, lags > effective_input_length - numdiff causes the
+            # lag slice in _predict_stack to be shorter than lag_params, raising
+            # a shape-mismatch RuntimeError.
+            safe_lags = min(best_lags, max(1, effective_input_length - numdiff))
             ar.fit_preset(
                 train_df_diff,
-                best_lags,
+                safe_lags,
                 do_diff,
                 device,
                 numdiff=numdiff,
@@ -337,7 +343,7 @@ class AutoARModel:
         extra_info:
             Dictionary with model metadata.
         """
-        task.load_full_dataset()
+        task.load_full_dataset(trust_remote_code=True)
 
         predictions = []
         total_train_time = 0.0
@@ -371,22 +377,29 @@ if __name__ == "__main__":
 
     # benchmark = fev.Benchmark.from_yaml("../../benchmarks/example/tasks.yaml")
     benchmark = fev.Benchmark.from_yaml(
-        "https://raw.githubusercontent.com/autogluon/fev/refs/heads/main/benchmarks/chronos_zeroshot/tasks.yaml"
+        "https://raw.githubusercontent.com/autogluon/fev/refs/heads/main/benchmarks/fev_bench/tasks.yaml"
     )
 
     summaries = []
     for task in tqdm(benchmark.tasks):
-        model = AutoARModel()
-        predictions, training_time, inference_time, extra_info = model.fit_predict(task)
-        evaluation_summary = task.evaluation_summary(
-            predictions,
-            model_name=model_name,
-            training_time_s=training_time,
-            inference_time_s=inference_time,
-            extra_info=extra_info,
-        )
-        print(evaluation_summary)
-        summaries.append(evaluation_summary)
+        try:
+            model = AutoARModel()
+            predictions, training_time, inference_time, extra_info = model.fit_predict(task)
+            evaluation_summary = task.evaluation_summary(
+                predictions,
+                model_name=model_name,
+                training_time_s=training_time,
+                inference_time_s=inference_time,
+                extra_info=extra_info,
+            )
+            print(evaluation_summary)
+            summaries.append(evaluation_summary)
+        except Exception as e:
+            task_name = getattr(task, "task_name", repr(task))
+            print(f"ERROR on task {task_name!r}: {type(e).__name__}: {e}")
+            import traceback
+
+            traceback.print_exc()
 
     summary_df = pd.DataFrame(summaries)
     print(summary_df)
