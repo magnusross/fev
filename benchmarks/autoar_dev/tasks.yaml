@@ -1,0 +1,64 @@
+tasks:
+# Hourly, energy price, small N, highly autocorrelated
+- dataset_path: autogluon/fev_datasets
+  dataset_config: epf_be
+  horizon: 24
+  num_windows: 5
+  seasonality: 24
+  eval_metric: MASE
+
+# Daily, ETT (paper's primary dataset, 7 channels × 4 datasets)
+- dataset_path: autogluon/fev_datasets
+  dataset_config: ETT_1D
+  horizon: 28
+  num_windows: 5
+  seasonality: 7
+  eval_metric: MASE
+  target: [HUFL, HULL, MUFL, MULL, LUFL, LULL, OT]
+  static_columns: []
+
+# Weekly, ETT
+- dataset_path: autogluon/fev_datasets
+  dataset_config: ETT_1W
+  horizon: 13
+  num_windows: 5
+  seasonality: 1
+  eval_metric: MASE
+  target: [HUFL, HULL, MUFL, MULL, LUFL, LULL, OT]
+  static_columns: []
+
+# Weekly, retail (many series)
+- dataset_path: autogluon/fev_datasets
+  dataset_config: rossmann_1W
+  horizon: 13
+  num_windows: 3
+  seasonality: 1
+  eval_metric: MASE
+  target: Sales
+
+# Monthly, healthcare (classic Monash dataset, many series)
+- dataset_path: autogluon/fev_datasets
+  dataset_config: hospital
+  horizon: 12
+  num_windows: 4
+  seasonality: 12
+  eval_metric: MASE
+  static_columns: []
+
+# Quarterly, macroeconomics (short series)
+- dataset_path: autogluon/fev_datasets
+  dataset_config: us_consumption_1Q
+  horizon: 8
+  num_windows: 5
+  seasonality: 4
+  eval_metric: MASE
+  static_columns: []
+
+# Yearly, global macro (very short series, hardest for AR)
+- dataset_path: autogluon/fev_datasets
+  dataset_config: world_co2_emissions
+  horizon: 5
+  num_windows: 3
+  seasonality: 1
+  eval_metric: MASE
+  static_columns: []

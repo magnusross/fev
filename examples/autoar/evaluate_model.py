@@ -4,8 +4,12 @@ From the paper "Specialized Foundation Models Struggle to Beat Supervised Baseli
 (https://github.com/Zongzhe-Xu/AutoAR).
 
 Design notes:
+- Per-column StandardScaler normalization (mirrors the paper's data pipeline)
 - KPSS stationarity testing determines the differencing order (0–2)
-- BIC-based lag selection via a small hyperparameter search on the first window
+- numdiff capped at 1 for short series (effective_input_length < 50) to prevent
+  double-differencing from removing all signal
+- BIC-based lag selection via a small hyperparameter search on the first window;
+  optional seasonal multiples added to the search space
 - OLS for efficient coefficient estimation (global model across all series)
 - Lag selection reuses best_lags from first window for all subsequent windows
 """
@@ -111,6 +115,46 @@ def _past_data_to_wide(past_df: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
     return wide_df.to_numpy().astype(float), list(wide_df.columns)
 
 
+def _standardize(data: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Standardize each column to zero mean and unit variance.
+
+    Returns the scaled array, per-column means, and per-column stds.
+    Columns with near-zero variance are left unchanged (std clamped to 1).
+    """
+    col_means = data.mean(axis=0)
+    col_stds = data.std(axis=0)
+    col_stds = np.where(col_stds < 1e-8, 1.0, col_stds)
+    return (data - col_means) / col_stds, col_means, col_stds
+
+
+def _build_search_space(
+    effective_input_length: int,
+    numdiff: int,
+    seasonality: int,
+    base_candidates: list[int],
+) -> dict:
+    """Merge base lag candidates with a few key seasonal multiples.
+
+    Only adds up to 4 seasonal multiples (1×s, 2×s, 4×s, 6×s) to avoid
+    overwhelming the BIC search with too many candidates, which can cause
+    it to pick suboptimally long lags.
+    """
+    max_lag = effective_input_length - numdiff
+    candidates = set(base_candidates)
+
+    # Add key seasonal multiples (sparse, not dense) to hint at periodicity
+    if seasonality > 1:
+        for k in [1, 2, 4, 6]:
+            lag = seasonality * k
+            if 0 < lag <= max_lag:
+                candidates.add(lag)
+
+    valid = sorted([c for c in candidates if 0 < c <= max_lag], reverse=True)
+    if not valid:
+        valid = [max(1, max_lag)]
+    return {"window_len": valid}
+
+
 class AutoARModel:
     """AutoAR: global AR model with KPSS differencing and BIC lag selection.
 
@@ -132,6 +176,23 @@ class AutoARModel:
         (the non-zero-shot candidates from the AutoAR paper).
     new_metric:
         Use BIC instead of raw MSE when ranking lag candidates (recommended).
+    standardize:
+        Standardize each series to zero mean and unit variance before fitting,
+        then reverse the transform on predictions.  Mirrors the ``StandardScaler``
+        used in the original paper's data pipeline and is critical for datasets
+        with heterogeneous series scales (default: True).
+    use_seasonal_lags:
+        Augment the lag search space with sparse seasonal multiples
+        (1×s, 2×s, 4×s, 6×s where s = task seasonality).  Helpful for
+        purely seasonal data like electricity prices but can hurt when BIC
+        prefers short seasonal lags over longer informative ones (default: True).
+    max_numdiff_short_series:
+        Maximum differencing order for short series (effective_input_length
+        < ``short_series_threshold``).  Prevents double-differencing from
+        removing nearly all signal on short windows (default: 1).
+    short_series_threshold:
+        effective_input_length below which ``max_numdiff_short_series`` is
+        applied (default: 50).
     """
 
     def __init__(
@@ -142,6 +203,10 @@ class AutoARModel:
         use_ols: bool = True,
         search_space: dict | None = None,
         new_metric: bool = True,
+        standardize: bool = True,
+        use_seasonal_lags: bool = True,
+        max_numdiff_short_series: int = 1,
+        short_series_threshold: int = 50,
     ):
         self.input_length = input_length
         self.time_limit_hours = time_limit_hours
@@ -149,6 +214,13 @@ class AutoARModel:
         self.use_ols = use_ols
         self.search_space = search_space or {"window_len": [192, 128, 96, 64]}
         self.new_metric = new_metric
+        # Fix 1: standardize each column before training (mirrors paper's StandardScaler)
+        self.standardize = standardize
+        # Fix 2: add seasonal multiples to lag search space
+        self.use_seasonal_lags = use_seasonal_lags
+        # Fix 3: cap numdiff on short series to prevent over-differencing
+        self.max_numdiff_short_series = max_numdiff_short_series
+        self.short_series_threshold = short_series_threshold
 
     def _get_device(self):
         import torch
@@ -185,6 +257,7 @@ class AutoARModel:
         """
         device = self._get_device()
         horizon = window.horizon
+        seasonality = task.seasonality or 1
 
         # ── 1. Convert past data to wide format ──────────────────────────────
         past_df, _future_df, _static_df = fev.convert_input_data(window, adapter="nixtla", as_univariate=True)
@@ -195,40 +268,50 @@ class AutoARModel:
         if effective_input_length is None:
             effective_input_length = max(2, min(self.input_length, T - horizon - 1))
 
-        # ── 3. Stationarity test ──────────────────────────────────────────────
+        # ── Fix 1: Standardize per column (mirrors the paper's StandardScaler) ─
+        # All AR fitting and prediction happens in standardized space; predictions
+        # are de-standardized before returning.
+        if self.standardize:
+            past_data_model, col_means_sc, col_stds_sc = _standardize(past_data)
+        else:
+            past_data_model = past_data
+            col_means_sc = np.zeros(N)
+            col_stds_sc = np.ones(N)
+
+        # ── 3. Stationarity test (on standardized data) ───────────────────────
         if self.use_kpss:
-            numdiff = _determine_numdiff_kpss(past_data)
+            numdiff = _determine_numdiff_kpss(past_data_model)
         else:
             numdiff = 1
+
+        # Fix 3: cap differencing order for short series — double-differencing
+        # on tiny windows removes almost all signal.
+        if effective_input_length < self.short_series_threshold:
+            numdiff = min(numdiff, self.max_numdiff_short_series)
+
         do_diff = numdiff > 0
 
         # ── 4. Prepare training DataFrames ────────────────────────────────────
         # fit_raw expects:
         #   scaled_train_df = differenced data  [T - numdiff, N]
-        #   scaled_val_df   = raw data          [T, N]
-        # fit_preset expects:
-        #   scaled_train_df = differenced data
+        #   scaled_val_df   = raw (standardized) data [T, N]
         if numdiff > 0:
-            train_arr_diff = np.diff(past_data, n=numdiff, axis=0)
+            train_arr_diff = np.diff(past_data_model, n=numdiff, axis=0)
         else:
-            train_arr_diff = past_data
+            train_arr_diff = past_data_model
 
-        # ── 5. Determine valid lag candidates ─────────────────────────────────
-        # AutoAR's internal limit: max_lags = input_length - numdiff
-        max_lag = effective_input_length - numdiff
-        valid_lags = sorted(
-            [lag for lag in self.search_space["window_len"] if 0 < lag <= max_lag],
-            reverse=True,
+        # ── 5. Determine lag candidates ───────────────────────────────────────
+        # Fix 2: merge base candidates with seasonal multiples so the model can
+        # capture periodic patterns (e.g. lag-24 for hourly, lag-7 for daily).
+        search_space = _build_search_space(
+            effective_input_length,
+            numdiff,
+            seasonality if self.use_seasonal_lags else 1,
+            self.search_space["window_len"],
         )
-        if not valid_lags:
-            valid_lags = [max(1, max_lag)]
-        search_space = {"window_len": valid_lags}
+        max_lag = max(search_space["window_len"])
 
         # ── 5b. Truncate DataFrames to bound memory usage ─────────────────────
-        # _unfold_df materialises an [N, num_windows, win_size] float64 tensor.
-        # For large N or long T this blows up (e.g. Traffic: 862 × 17 000 × 536
-        # ≈ 63 GB).  We cap the number of rolling windows to keep each tensor
-        # below _MAX_UNFOLD_ELEMENTS elements (~400 MB at float64).
         _MAX_ELEMENTS = 50_000_000  # ~400 MB per tensor
 
         win_size = effective_input_length + horizon
@@ -239,7 +322,7 @@ class AutoARModel:
         max_train_rows = min(len(train_arr_diff), max_lag + max_train_windows)
 
         train_df_diff = pd.DataFrame(train_arr_diff[-max_train_rows:])
-        train_df_raw_val = pd.DataFrame(past_data[-max_val_rows:])
+        train_df_raw_val = pd.DataFrame(past_data_model[-max_val_rows:])
 
         # ── 6. Fit ────────────────────────────────────────────────────────────
         ar = AR_diff(effective_input_length, horizon)
@@ -265,14 +348,11 @@ class AutoARModel:
                     )
                     best_lags = ar.best_lags
                 else:
-                    # Series too short for HPO; fall back to smallest candidate
-                    best_lags = valid_lags[-1]
+                    # Series too short for HPO; use largest feasible lag
+                    best_lags = search_space["window_len"][0]
 
             # Clamp best_lags to be safe for the current numdiff.
-            # best_lags was selected on the first window; if a later window has a
-            # larger numdiff, lags > effective_input_length - numdiff causes the
-            # lag slice in _predict_stack to be shorter than lag_params, raising
-            # a shape-mismatch RuntimeError.
+            assert best_lags is not None
             safe_lags = min(best_lags, max(1, effective_input_length - numdiff))
             ar.fit_preset(
                 train_df_diff,
@@ -284,16 +364,12 @@ class AutoARModel:
             )
         train_time = time.monotonic() - train_start
 
-        # ── 7. Build test DataFrame ────────────────────────────────────────────
-        # test_loss_acc_df internally applies differencing via torch.diff, so we
-        # pass raw data.  The function expects [input_length + horizon, N] rows;
-        # the last `horizon` rows act as placeholder "targets" (zeros work fine
-        # because we only use the returned predictions tensor, not the MSE).
-        context = past_data[-effective_input_length:]
+        # ── 7. Build test DataFrame (in standardized space) ────────────────────
+        context = past_data_model[-effective_input_length:]
         if len(context) < effective_input_length:
             pad_len = effective_input_length - len(context)
-            col_means = past_data.mean(axis=0, keepdims=True)
-            context = np.vstack([np.tile(col_means, (pad_len, 1)), context])
+            pad_val = past_data_model.mean(axis=0, keepdims=True)
+            context = np.vstack([np.tile(pad_val, (pad_len, 1)), context])
         test_arr = np.vstack([context, np.zeros((horizon, N))])
         test_df = pd.DataFrame(test_arr)
 
@@ -301,17 +377,19 @@ class AutoARModel:
         inf_start = time.monotonic()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            mse, mae, preds_tensor, _ = ar.test_loss_acc_df(test_df, device, numdiff=numdiff, return_prediction=True)
+            _mse, _mae, preds_tensor, _ = ar.test_loss_acc_df(
+                test_df, device, numdiff=numdiff, return_prediction=True
+            )
         inf_time = time.monotonic() - inf_start
 
-        # preds_tensor shape: [num_series, num_windows=1, horizon]
+        # preds_tensor shape: [N, num_windows=1, horizon]
         preds = preds_tensor[:, 0, :].detach().cpu().numpy()  # [N, horizon]
 
+        # ── Fix 1 (continued): reverse standardization ────────────────────────
+        if self.standardize:
+            preds = preds * col_stds_sc[:, None] + col_means_sc[:, None]
+
         # ── 9. Format for FEV ─────────────────────────────────────────────────
-        # Each row i of preds corresponds to col_order[i] (sorted unique_id).
-        # combine_univariate_predictions_to_multivariate expects predictions
-        # cycled through target columns: [item1_col1, item1_col2, item2_col1, ...]
-        # which matches alphabetical unique_id order. ✓
         quantile_levels = task.quantile_levels
         predictions_list = []
         for i in range(N):
@@ -368,17 +446,30 @@ class AutoARModel:
             "use_kpss": self.use_kpss,
             "use_ols": self.use_ols,
             "new_metric": self.new_metric,
+            "standardize": self.standardize,
         }
         return predictions, total_train_time, total_inf_time, extra_info
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--benchmark", default="dev", choices=["dev", "example", "full"])
+    parser.add_argument("--out", default=None)
+    args = parser.parse_args()
+
     model_name = "autoar"
 
-    # benchmark = fev.Benchmark.from_yaml("../../benchmarks/example/tasks.yaml")
-    benchmark = fev.Benchmark.from_yaml(
-        "https://raw.githubusercontent.com/autogluon/fev/refs/heads/main/benchmarks/fev_bench/tasks.yaml"
-    )
+    if args.benchmark == "dev":
+        benchmark = fev.Benchmark.from_yaml("../../benchmarks/autoar_dev/tasks.yaml")
+    elif args.benchmark == "example":
+        benchmark = fev.Benchmark.from_yaml("../../benchmarks/example/tasks.yaml")
+    else:
+        benchmark = fev.Benchmark.from_yaml(
+            "https://raw.githubusercontent.com/autogluon/fev/refs/heads/main/benchmarks/fev_bench/tasks.yaml"
+        )
+    out_file = args.out or f"{model_name}_{args.benchmark}.csv"
 
     summaries = []
     for task in tqdm(benchmark.tasks):
@@ -403,4 +494,5 @@ if __name__ == "__main__":
 
     summary_df = pd.DataFrame(summaries)
     print(summary_df)
-    summary_df.to_csv(f"{model_name}.csv", index=False)
+    summary_df.to_csv(out_file, index=False)
+    print(f"\nSaved results to {out_file}")
