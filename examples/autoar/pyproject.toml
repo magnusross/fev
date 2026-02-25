@@ -1,0 +1,12 @@
+[project]
+name = "autoar-fev"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "fev>=0.7.1",
+  "torch>=2.0.0",
+  "statsmodels>=0.14.0",
+  "matplotlib>=3.5.0",
+  "tqdm>=4.0.0",
+  "scipy>=1.10.0",
+]
